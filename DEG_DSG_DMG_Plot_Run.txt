@@ -1,0 +1,706 @@
+#!/usr/bin/env Rscript
+# ------------------------------------------------------------
+# FULL PIPELINE (DEG + DSG + DMG) with CONDITIONED DSG–DMG COMMON,
+# and DSG-vs-DMG scatter plotting ONLY:
+#   - DMG only (green)
+#   - DSG only (red)
+#   - COMMON (conditioned; yellow)
+# (NO grey "DSG+DMG_notCond" points)
+# ------------------------------------------------------------
+#
+# What this script does, end to end, per comparison (e.g. D15vsD50):
+#   1. Reads that comparison's DMR file (methylation), DEG file (expression),
+#      and splicing file (from earlier steps of the pipeline).
+#   2. Filters DMRs down to exon/intron regions with |diffMeth| above a
+#      cutoff, then collapses to gene level (DMG_all), optionally requiring
+#      all DMRs for a gene to agree in direction (same_sign_if_multi).
+#   3. Filters splicing events by FDR + |delta_PSI|, keeps the single
+#      strongest event per gene (DSG_top).
+#   4. Defines "DMG_spliceProx": DMG genes whose DMR actually overlaps
+#      (within --flank bp) the specific splicing event coordinates -- a
+#      stricter, position-aware version of "this gene is both DSG and DMG".
+#   5. COMMON_cond = DSG genes AND DMG_spliceProx genes -- i.e. genes that
+#      are both spliced differently AND have a DMR near that specific event
+#      (not just anywhere in the gene).
+#   6. Draws 2-way and 3-way Venn diagrams (DEG/DMG, DSG/DMG conditioned,
+#      DEG/DSG/DMG conditioned) and DEG-vs-DMG / DSG-vs-DMG scatter plots.
+#   7. Writes out gene lists (per comparison and pooled across all
+#      comparisons) and two summary tables: one with the final gene-set
+#      sizes per comparison, one with the filtering funnel (how many DMR
+#      rows survive each filtering step).
+#
+# Run with --help for all CLI options; key ones: --dmr_dir, --deg_dir,
+# --splicing_dir, --out_dir, --dmr_abs_diff, --fdr_cut, --psi_cut, --flank.
+# ------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readr)
+  library(dplyr)
+  library(stringr)
+  library(VennDiagram)
+  library(grid)
+  library(ggplot2)
+  library(argparse)
+})
+
+# ---------------- args ----------------
+p <- ArgumentParser()
+p$add_argument("--dmr_dir", default=".", help="Directory with *_DMR_Annotated.txt (default: .)")
+p$add_argument("--deg_dir", default="DEG", help="Directory with DEG_<COMP>.csv / DEG_<COMP>_edit.csv (default: DEG)")
+p$add_argument("--splicing_dir", default="Splicing", help="Directory with splicing CSVs (default: Splicing)")
+p$add_argument("--out_dir", default="FIGS_ALL_DEG_DSG_DMG_REGION_EXON_INTRON_CONDITIONED", help="Output directory")
+
+# run control
+p$add_argument("--only_comp", default="", help="Run only this comparison, e.g. D15vsD50 (default: all)")
+p$add_argument("--comps", default="", help="Comma-separated comps, e.g. D15vsD50,P15vsD15 (default: all)")
+
+# splicing filters
+p$add_argument("--fdr_cut", type="double", default=0.05, help="FDR cutoff for splicing (default 0.05)")
+p$add_argument("--psi_cut", type="double", default=0.10, help="|ΔPSI| cutoff AFTER FDR (default 0.10)")
+p$add_argument("--include_types", default="SE,MXE,A3SS,A5SS,RI", help="Splicing types to include")
+p$add_argument("--flank", type="integer", default=200, help="bp flank around splicing event for DMR overlap (default 200)")
+
+# DMR filtering controls
+p$add_argument("--dmr_abs_diff", type="double", default=0.10,
+               help="Keep only exon/intron DMR rows with abs(diffMeth) >= this value (default 0.10)")
+p$add_argument("--same_sign_if_multi", default="TRUE",
+               help="For DMG_all: if gene has >1 kept exon/intron DMR, require same directionality? (default TRUE)")
+p$add_argument("--same_sign_spliceProx", default="TRUE",
+               help="For DMG_spliceProx: if gene has >1 OVERLAPPING DMR, require same directionality? (default TRUE)")
+
+args <- p$parse_args()
+
+# -- convert CLI string args into usable R types: split include_types into a
+# vector, and coerce the TRUE/FALSE-as-string flags into real logicals
+inc_types <- strsplit(args$include_types, ",")[[1]] |> trimws()
+same_sign_if_multi   <- toupper(args$same_sign_if_multi) %in% c("TRUE","T","1","YES","Y")
+same_sign_spliceProx <- toupper(args$same_sign_spliceProx) %in% c("TRUE","T","1","YES","Y")
+
+# -- sanity-check numeric args are in valid ranges before the run starts
+stopifnot(is.finite(args$dmr_abs_diff) && args$dmr_abs_diff >= 0)
+stopifnot(is.finite(args$fdr_cut) && args$fdr_cut >= 0 && args$fdr_cut <= 1)
+stopifnot(is.finite(args$psi_cut) && args$psi_cut >= 0)
+stopifnot(is.finite(args$flank) && args$flank >= 0)
+
+# comparison selection
+# -- --only_comp takes priority (single comparison); otherwise --comps gives
+# a comma-separated allow-list; if neither is set, every comparison found in
+# dmr_dir is processed
+only_set <- trimws(args$only_comp)
+comps_keep <- character()
+if (nzchar(only_set)) {
+  comps_keep <- only_set
+} else if (nzchar(trimws(args$comps))) {
+  comps_keep <- strsplit(trimws(args$comps), ",", fixed=TRUE)[[1]] |> trimws()
+  comps_keep <- comps_keep[nzchar(comps_keep)]
+}
+
+# output dirs
+# -- everything this run produces goes under out_dir, split into figs/
+# (Venn diagrams + scatter plots), lists/ (gene name .txt files), and
+# tables/ (per-comparison scatter data + filtering summary TSVs)
+outdir <- args$out_dir
+out_figs   <- file.path(outdir, "figs")
+out_lists  <- file.path(outdir, "lists")
+out_tables <- file.path(outdir, "tables")
+dir.create(out_figs,   recursive=TRUE, showWarnings=FALSE)
+dir.create(out_lists,  recursive=TRUE, showWarnings=FALSE)
+dir.create(out_tables, recursive=TRUE, showWarnings=FALSE)
+
+message("Parameters:
+  dmr_dir=", args$dmr_dir, "
+  deg_dir=", args$deg_dir, "
+  splicing_dir=", args$splicing_dir, "
+  out_dir=", outdir, "
+  only_comp=", ifelse(nzchar(only_set), only_set, "(all)"), "
+  comps=", ifelse(length(comps_keep), paste(comps_keep, collapse=","), "(all)"), "
+  dmr_abs_diff=", args$dmr_abs_diff, "
+  same_sign_if_multi(DMG_all)=", same_sign_if_multi, "
+  fdr_cut=", args$fdr_cut, "
+  psi_cut=", args$psi_cut, "
+  include_types=", paste(inc_types, collapse=","), "
+  flank=", args$flank, "
+  same_sign_spliceProx=", same_sign_spliceProx
+)
+
+# ---------------- helpers ----------------
+
+# -- pulls the comparison label (e.g. "D15vsD50") out of a DMR filename by
+# stripping the known suffix and joining the first two underscore-separated
+# tokens with "vs"
+infer_comp_from_dmr_filename <- function(f) {
+  base <- basename(f)
+  base <- sub("_DMR_Annotated\\.txt$", "", base)
+  parts <- strsplit(base, "_", fixed=TRUE)[[1]]
+  if (length(parts) < 2) return(NA_character_)
+  paste0(parts[1], "vs", parts[2])
+}
+
+# -- locates the DEG file for a given comparison, preferring the "_edit.csv"
+# variant if both exist
+find_deg_file <- function(comp, deg_dir) {
+  f1 <- file.path(deg_dir, paste0("DEG_", comp, "_edit.csv"))
+  f2 <- file.path(deg_dir, paste0("DEG_", comp, ".csv"))
+  if (file.exists(f1)) return(f1)
+  if (file.exists(f2)) return(f2)
+  NA_character_
+}
+
+# -- locates the splicing results file for a given comparison: first tries
+# the expected rMATS-style naming pattern, then falls back to any CSV whose
+# name contains the comparison label
+find_splicing_file <- function(comp, splicing_dir) {
+  patt1 <- paste0("^", comp, "_FDR_0\\.05_All_JC_DSpliceEvents_.*\\.csv$")
+  hit1 <- list.files(splicing_dir, pattern=patt1, full.names=TRUE)
+  if (length(hit1)) return(hit1[1])
+  hit2 <- list.files(splicing_dir, pattern=paste0(comp, ".*\\.csv$"), full.names=TRUE)
+  if (length(hit2)) return(hit2[1])
+  NA_character_
+}
+
+# -- collapses rMATS's exon1/exon2 and long/short sub-types (MXE, A5SS,
+# A3SS) down to their parent splicing-type label, leaving other types as-is
+collapse_type <- function(x) {
+  dplyr::case_when(
+    x %in% c("MXE_exon1","MXE_exon2") ~ "MXE",
+    x %in% c("A5SS_long","A5SS_short") ~ "A5SS",
+    x %in% c("A3SS_long","A3SS_short") ~ "A3SS",
+    TRUE ~ x
+  )
+}
+
+# -- classifies a DMR annotation string as "exon", "intron", or "other"
+# based on its leading word
+anno_to_feature_type <- function(a) {
+  low <- tolower(trimws(as.character(a)))
+  if (grepl("^exon", low)) "exon"
+  else if (grepl("^intron", low)) "intron"
+  else "other"
+}
+
+# -- TRUE if every value in x has the same sign (all non-negative or all
+# non-positive) -- used to check whether multiple DMRs for one gene agree
+# in methylation direction
+same_dir_fun <- function(x) all(x >= 0) || all(x <= 0)
+
+# -- trims, drops NA/empty, and de-duplicates+sorts a vector of gene names;
+# the shared cleanup step used before every gene list is written out
+clean_genes <- function(x) {
+  x <- trimws(as.character(x))
+  x <- x[!is.na(x) & x != ""]
+  sort(unique(x))
+}
+
+# -- cleans a gene vector via clean_genes() and writes it to file, one gene
+# per line; also returns the cleaned vector so callers can reuse it
+write_lines <- function(x, file) {
+  x <- clean_genes(x)
+  writeLines(x, file)
+  x
+}
+
+# -- reads a DEG csv, locates the gene-name column (tries several common
+# header names) and the log2FC column, and returns a clean 2-column
+# data.frame (gene, log2FC) with only finite values
+read_deg <- function(deg_file) {
+  D <- suppressWarnings(read.csv(deg_file, stringsAsFactors=FALSE))
+  if (!("log2FC" %in% names(D))) stop("DEG file missing log2FC column: ", deg_file)
+  gcol <- intersect(c("Gene","gene","gene_id","GeneID","SYMBOL","Symbol"), names(D))
+  if (!length(gcol)) stop("DEG file missing gene column: ", deg_file)
+  out <- D %>%
+    transmute(gene = trimws(as.character(.data[[gcol[1]]])),
+              log2FC = suppressWarnings(as.numeric(log2FC))) %>%
+    filter(!is.na(gene) & gene != "" & is.finite(log2FC))
+  as.data.frame(out)
+}
+
+# ---- CUSTOM venns with counts ----
+
+# -- draws a 2-set Venn diagram (VennDiagram::draw.pairwise.venn) directly
+# from precomputed set sizes + overlap count, rather than the raw sets
+# themselves; cross is clamped so it never exceeds either area
+venn2_custom_counts <- function(area1, area2, cross, name1, name2, col1, col2, outpath) {
+  area1 <- as.integer(area1); area2 <- as.integer(area2); cross <- as.integer(cross)
+  cross <- max(0, min(cross, area1, area2))
+  png(outpath, width=1800, height=1600, res=200)
+  grid.newpage()
+  vp <- draw.pairwise.venn(
+    area1=area1, area2=area2, cross.area=cross,
+    category=c(name1, name2),
+    fill=c(col1, col2),
+    alpha=c(0.6, 0.6),
+    cat.col=c(col1, col2),
+    cex=1.6, cat.cex=1.4,
+    lty="blank", ind=FALSE
+  )
+  grid.draw(vp)
+  dev.off()
+}
+
+# -- draws a 3-set Venn diagram (VennDiagram::draw.triple.venn) from
+# precomputed set sizes + pairwise/triple overlap counts; each overlap
+# count is clamped so it stays logically consistent with the sets it's
+# derived from (e.g. n123 can't exceed any of the pairwise counts)
+venn3_custom_counts <- function(area1, area2, area3, n12, n13, n23, n123,
+                                n1="DEG", n2="DSG", n3="DMG",
+                                col1="#4470AD", col2="#AA2F33", col3="#00570E",
+                                outpath) {
+  area1 <- as.integer(area1); area2 <- as.integer(area2); area3 <- as.integer(area3)
+  n12 <- as.integer(n12); n13 <- as.integer(n13); n23 <- as.integer(n23); n123 <- as.integer(n123)
+  n123 <- max(0, min(n123, n12, n13, n23))
+  n12  <- max(0, min(n12, area1, area2))
+  n13  <- max(0, min(n13, area1, area3))
+  n23  <- max(0, min(n23, area2, area3))
+
+  png(outpath, width=2000, height=1800, res=200)
+  grid.newpage()
+  vp <- draw.triple.venn(
+    area1=area1, area2=area2, area3=area3,
+    n12=n12, n13=n13, n23=n23, n123=n123,
+    category=c(n1,n2,n3),
+    fill=c(col1,col2,col3),
+    alpha=rep(0.55, 3),
+    cat.col=c(col1,col2,col3),
+    cex=1.3, cat.cex=1.1,
+    lty="blank", ind=FALSE
+  )
+  grid.draw(vp)
+  dev.off()
+}
+
+# ---- scatters ----
+
+# -- builds the per-gene table behind the DEG-vs-DMG scatter plot: takes the
+# union of genes present in DEG and/or DMG_gene tables, fills in 0 for the
+# axis a gene is missing from (so it plots on that axis), and labels each
+# gene as "DEG only" / "DMG only" / "COMMON"
+build_scatter_deg_dmg <- function(DEG, METH_gene) {
+  deg_dt  <- as.data.table(DEG)
+  meth_dt <- as.data.table(METH_gene)
+
+  deg_dt[, gene := trimws(as.character(gene))]
+  meth_dt[, gene := trimws(as.character(gene))]
+  deg_dt  <- deg_dt[!is.na(gene) & gene != ""]
+  meth_dt <- meth_dt[!is.na(gene) & gene != ""]
+
+  deg_genes <- unique(deg_dt$gene)
+  dmg_genes <- unique(meth_dt$gene)
+  all_genes <- sort(unique(c(deg_genes, dmg_genes)))
+
+  DT <- data.table(gene = all_genes)
+  DT[, in_DEG := gene %in% deg_genes]
+  DT[, in_DMG := gene %in% dmg_genes]
+
+  DT <- merge(DT, deg_dt,  by="gene", all.x=TRUE)
+  DT <- merge(DT, meth_dt, by="gene", all.x=TRUE)
+
+  DT[in_DEG == FALSE, log2FC := 0]
+  DT[in_DMG == FALSE, diffMeth := 0]
+
+  DT[, Type := fifelse(in_DEG & in_DMG, "COMMON",
+                fifelse(in_DEG & !in_DMG, "DEG only",
+                fifelse(!in_DEG & in_DMG, "DMG only", NA_character_)))]
+
+  DT[]
+}
+
+# DSG scatter: ONLY 3 classes (DSG only, DMG only, COMMON_conditioned)
+# -- same idea as build_scatter_deg_dmg(), but restricted to only the genes
+# in dsg_only, dmg_only, or the *conditioned* common set (COMMON_cond from
+# the main loop) -- this is what keeps the grey "DSG+DMG_notCond" points out
+# of the plot, per the header comment at the top of the script
+build_scatter_dsg_dmg_only_common <- function(SPL_gene, METH_gene, common_cond_genes, dmg_all_genes, dsg_genes) {
+  sp_dt   <- as.data.table(SPL_gene)
+  meth_dt <- as.data.table(METH_gene)
+
+  sp_dt[, gene := trimws(as.character(gene))]
+  meth_dt[, gene := trimws(as.character(gene))]
+  sp_dt   <- sp_dt[!is.na(gene) & gene != ""]
+  meth_dt <- meth_dt[!is.na(gene) & gene != ""]
+
+  dsg_genes <- clean_genes(dsg_genes)
+  dmg_all_genes <- clean_genes(dmg_all_genes)
+  common_cond_genes <- clean_genes(common_cond_genes)
+
+  # ONLY plot genes in one of these 3 displayed groups:
+  dsg_only <- setdiff(dsg_genes, dmg_all_genes)
+  dmg_only <- setdiff(dmg_all_genes, dsg_genes)
+  keep_genes <- sort(unique(c(dsg_only, dmg_only, common_cond_genes)))
+
+  DT <- data.table(gene = keep_genes)
+  DT[, in_DSG := gene %in% dsg_genes]
+  DT[, in_DMG := gene %in% dmg_all_genes]
+  DT[, in_COMMON := gene %in% common_cond_genes]
+
+  DT <- merge(DT, sp_dt,   by="gene", all.x=TRUE)
+  DT <- merge(DT, meth_dt, by="gene", all.x=TRUE)
+
+  # axis points
+  DT[in_DSG == FALSE, delta_PSI := 0]  # DMG-only -> x=0
+  DT[in_DMG == FALSE, diffMeth := 0]   # DSG-only -> y=0
+
+  # Type
+  DT[, Type := fifelse(in_COMMON, "COMMON",
+                fifelse(in_DSG & !in_DMG, "DSG only",
+                fifelse(!in_DSG & in_DMG, "DMG only", NA_character_)))]
+
+  DT[!is.na(Type)]
+}
+
+# -- renders the DEG-vs-DMG scatter (log2FC on x, diffMeth on y), colored by
+# Type; axis limits and styling are fixed so every comparison's plot is
+# directly visually comparable
+plot_scatter_deg <- function(df, outpath) {
+  if (!nrow(df)) return(invisible())
+  cols <- c("DEG only"="#4470AD", "DMG only"="#00570E", "COMMON"="#FFC067")
+  p <- ggplot(df, aes(x=log2FC, y=diffMeth, color=Type)) +
+    geom_point(alpha=0.8, size=2) +
+    geom_vline(xintercept=0, linetype="dashed", color="gray50") +
+    geom_hline(yintercept=0, linetype="dashed", color="gray50") +
+    scale_x_continuous(limits=c(-10,10)) +
+    scale_y_continuous(limits=c(-1,1)) +
+    scale_color_manual(values=cols) +
+    theme_bw(base_size=16) +
+    theme(panel.grid=element_blank(),
+          axis.title=element_blank(),
+          plot.title=element_blank(),
+          axis.text=element_text(size=25),
+          legend.position="none")
+  ggsave(outpath, p, width=8, height=8, dpi=900)
+}
+
+# -- renders the DSG-vs-DMG scatter (delta_PSI on x, diffMeth on y), colored
+# by Type, using a fixed 1:1 aspect ratio (coord_fixed) since both axes
+# share the same [-1, 1] range
+plot_scatter_dsg_only_common <- function(df, outpath) {
+  if (!nrow(df)) return(invisible())
+  cols <- c("DSG only"="#AA2F33", "DMG only"="#00570E", "COMMON"="#FFC067")
+  p <- ggplot(df, aes(x=delta_PSI, y=diffMeth, color=Type)) +
+    geom_point(alpha=0.85, size=2) +
+    geom_vline(xintercept=0, linetype="dashed", color="gray50") +
+    geom_hline(yintercept=0, linetype="dashed", color="gray50") +
+    scale_x_continuous(limits=c(-1,1)) +
+    scale_y_continuous(limits=c(-1,1)) +
+    scale_color_manual(values=cols) +
+    coord_fixed(ratio=1) +
+    theme_bw(base_size=16) +
+    theme(panel.grid=element_blank(),
+          axis.title=element_blank(),
+          plot.title=element_blank(),
+          axis.text=element_text(size=25),
+          legend.position="none")
+  ggsave(outpath, p, width=8, height=8, dpi=900)
+}
+
+# ---------------- main ----------------
+dmr_files <- list.files(args$dmr_dir, pattern="*_DMR_Annotated\\.txt$", full.names=TRUE)
+if (!length(dmr_files)) stop("No *_DMR_Annotated.txt in: ", args$dmr_dir)
+
+summary_rows <- list()
+filter_rows  <- list()
+
+# -- accumulate gene sets across all comparisons so a pooled "seen in any
+# comparison" list can be written after the loop finishes
+DMG_all_union_all_comps <- character()
+COMMON_union_all_comps  <- character()
+
+for (dmr_path in sort(dmr_files)) {
+  comp <- infer_comp_from_dmr_filename(dmr_path)
+  if (is.na(comp)) next
+  if (length(comps_keep) && !(comp %in% comps_keep)) next
+
+  deg_file <- find_deg_file(comp, args$deg_dir)
+  sp_file  <- find_splicing_file(comp, args$splicing_dir)
+  if (is.na(deg_file)) { message("Skip ", comp, ": missing DEG file"); next }
+  if (is.na(sp_file))  { message("Skip ", comp, ": missing splicing file"); next }
+
+  message("\n=== ", comp, " ===")
+  message("DMR: ", dmr_path)
+  message("DEG: ", deg_file)
+  message("SP : ", sp_file)
+
+  # ---- Read DMR and standardize columns ----
+  # -- different upstream tools/runs may label these columns slightly
+  # differently, so ren() renames whichever variant is found (case-
+  # insensitively) to a single canonical name used for the rest of the script
+  DMR <- suppressWarnings(fread(dmr_path, sep="\t", header=TRUE))
+  setnames(DMR, trimws(names(DMR)))
+  nm <- tolower(names(DMR))
+
+  ren <- function(old, new) {
+    w <- which(nm %in% tolower(old))[1]
+    if (!is.na(w)) setnames(DMR, names(DMR)[w], new)
+  }
+  ren(c("chr","chrom","seqnames","Chr"), "chr")
+  ren(c("start","Start"), "start")
+  ren(c("end","End","stop"), "end")
+  ren(c("diffmeth","diffmethy","diff.methy","diff"), "diffMeth")
+  ren(c("geneid","geneId","gene_id","gene"), "geneId")
+  ren(c("annotation","Annotation","annot"), "annotation")
+
+  req <- c("chr","start","end","geneId","annotation","diffMeth")
+  miss <- setdiff(req, names(DMR))
+  if (length(miss)) {
+    message("Skip ", comp, ": DMR missing columns: ", paste(miss, collapse=", "))
+    next
+  }
+
+  DMR[, `:=`(
+    chr = as.character(chr),
+    start = as.integer(start),
+    end = as.integer(end),
+    geneId = trimws(as.character(geneId)),
+    annotation = as.character(annotation),
+    diffMeth = as.numeric(diffMeth)
+  )]
+
+  # -- drop rows with missing/invalid coordinates, gene ID, or diffMeth
+  DMR <- DMR[!is.na(geneId) & geneId != "" &
+             !is.na(chr) & !is.na(start) & !is.na(end) &
+             is.finite(diffMeth)]
+  n_raw <- nrow(DMR)
+
+  DMR[, dmr_type := vapply(annotation, anno_to_feature_type, character(1))]
+
+  # DMR_base: exon/intron + abs diff cutoff (NO gene-wide same-sign)
+  # -- this is the filtering funnel: start from exon/intron rows only, then
+  # apply the |diffMeth| cutoff; n_ei / n_after_abs are recorded per
+  # comparison for the filtering summary table
+  DMR_base <- DMR[dmr_type %in% c("exon","intron")]
+  n_ei <- nrow(DMR_base)
+  DMR_base <- DMR_base[abs(diffMeth) >= args$dmr_abs_diff]
+  n_after_abs <- nrow(DMR_base)
+
+  # DMG_all: apply gene-wide same-sign if multi
+  # -- if a gene has more than one surviving DMR, optionally require them to
+  # all point the same direction (hyper- or hypo-methylated) before counting
+  # that gene as a confident DMG
+  DMR_ei <- copy(DMR_base)
+  if (same_sign_if_multi && nrow(DMR_ei)) {
+    gstat <- DMR_ei[, .(nDMR=.N, same_dir = same_dir_fun(diffMeth)), by=geneId]
+    keep <- gstat[nDMR == 1 | (nDMR > 1 & same_dir == TRUE), geneId]
+    DMR_ei <- DMR_ei[geneId %in% keep]
+  }
+  n_after_same_all <- nrow(DMR_ei)
+
+  DMG_all_genes <- clean_genes(DMR_ei$geneId)
+  DMG_all_union_all_comps <- c(DMG_all_union_all_comps, DMG_all_genes)
+
+  # gene-level methylation for scatter y: strongest |diffMeth|
+  # -- when a gene has multiple DMRs, only its single largest-magnitude
+  # diffMeth value is used to place it on the scatter plot's y-axis
+  METH_gene <- if (nrow(DMR_ei)) {
+    DMR_ei[, .SD[which.max(abs(diffMeth))], by=geneId][, .(gene=geneId, diffMeth=diffMeth)]
+  } else data.table(gene=character(), diffMeth=numeric())
+
+  # ---- DEG ----
+  DEG <- read_deg(deg_file)
+  DEG_genes <- clean_genes(DEG$gene)
+
+  # ---- DSG: read + filter + TOP event per gene ----
+  sp <- suppressMessages(read_csv(sp_file, show_col_types = FALSE))
+  need_sp <- c("GeneID","chr","start","end","SplicingType","FDR","delta_PSI")
+  if (!all(need_sp %in% names(sp))) {
+    message("Skip ", comp, ": splicing missing columns (need ", paste(need_sp, collapse=","), ")")
+    next
+  }
+
+  # -- clean/coerce types, restrict to the requested splicing types
+  # (inc_types), then apply the FDR and |delta_PSI| cutoffs
+  sp2 <- sp %>%
+    mutate(
+      GeneID = trimws(as.character(GeneID)),
+      chr = as.character(chr),
+      start = suppressWarnings(as.integer(start)),
+      end = suppressWarnings(as.integer(end)),
+      SplicingType = collapse_type(as.character(SplicingType)),
+      FDR = suppressWarnings(as.numeric(FDR)),
+      delta_PSI = suppressWarnings(as.numeric(delta_PSI))
+    ) %>%
+    filter(!is.na(GeneID) & GeneID != "") %>%
+    filter(SplicingType %in% inc_types) %>%
+    filter(is.finite(FDR) & is.finite(delta_PSI)) %>%
+    filter(FDR <= args$fdr_cut) %>%
+    filter(abs(delta_PSI) >= args$psi_cut)
+
+  # -- when a gene has multiple significant splicing events, keep only the
+  # one with the largest |delta_PSI| (ties broken by smaller FDR)
+  SP_top <- if (nrow(sp2)) {
+    sp_dt <- as.data.table(sp2)
+    sp_dt[, absPSI := abs(delta_PSI)]
+    setorder(sp_dt, GeneID, -absPSI, FDR)
+    sp_dt[, .SD[1], by=GeneID]
+  } else {
+    as.data.table(sp2)[0]
+  }
+
+  DSG_genes <- clean_genes(SP_top$GeneID)
+  SPL_gene <- if (nrow(SP_top)) SP_top[, .(gene=GeneID, delta_PSI=delta_PSI)] else data.table(gene=character(), delta_PSI=numeric())
+
+  # ---- DMG_spliceProx genes (condition helper) ----
+  # -- stricter than "gene is in DMG_all": here a DMR only counts if its
+  # genomic interval actually overlaps the top splicing event's coordinates
+  # (expanded by --flank bp on each side), i.e. the methylation change is
+  # physically near the specific splicing event, not just somewhere in the
+  # same gene
+  DMG_spliceProx_genes <- character()
+  if (nrow(DMR_base) && nrow(SP_top)) {
+    sp_top_dt <- as.data.table(SP_top)
+    sp_top_dt[, `:=`(
+      s2 = pmax(0L, as.integer(start) - as.integer(args$flank)),
+      e2 = as.integer(end) + as.integer(args$flank)
+    )]
+
+    setkey(DMR_base, geneId, chr)
+    setkey(sp_top_dt, GeneID, chr)
+
+    OV <- DMR_base[sp_top_dt, on=.(geneId=GeneID, chr), nomatch=0]
+    OV <- OV[start <= e2 & end >= s2]
+
+    if (same_sign_spliceProx && nrow(OV)) {
+      g2 <- OV[, .(n=.N, same=same_dir_fun(diffMeth)), by=geneId]
+      keep2 <- g2[n==1 | same==TRUE, geneId]
+      OV <- OV[geneId %in% keep2]
+    }
+
+    DMG_spliceProx_genes <- clean_genes(OV$geneId)
+  }
+
+  # ---- CONDITIONED COMMON for DSG vs DMG ----
+  # -- the "conditioned" common set: genes that are both a top DSG AND a
+  # DMG_spliceProx gene (position-aware overlap), rather than just any DSG
+  # ∩ DMG_all gene -- this is the stricter definition used throughout the
+  # DSG-vs-DMG Venn/scatter outputs
+  COMMON_cond <- intersect(DSG_genes, DMG_spliceProx_genes)
+  COMMON_union_all_comps <- c(COMMON_union_all_comps, COMMON_cond)
+
+  # ---------------- Venns ----------------
+  venn2_custom_counts(
+    area1 = length(DEG_genes),
+    area2 = length(DMG_all_genes),
+    cross = length(intersect(DEG_genes, DMG_all_genes)),
+    name1 = "DEG", name2 = "DMG_all",
+    col1 = "#4470AD", col2 = "#00570E",
+    outpath = file.path(out_figs, paste0("Venn_DEG_vs_DMG_all_", comp, ".png"))
+  )
+
+  venn2_custom_counts(
+    area1 = length(DSG_genes),
+    area2 = length(DMG_all_genes),
+    cross = length(COMMON_cond),
+    name1 = "DSG", name2 = "DMG_all",
+    col1 = "#AA2F33", col2 = "#00570E",
+    outpath = file.path(out_figs, paste0("Venn_DSG_vs_DMG_all_CONDITIONED_", comp, ".png"))
+  )
+
+  n12  <- length(intersect(DEG_genes, DSG_genes))
+  n13  <- length(intersect(DEG_genes, DMG_all_genes))
+  n23c <- length(COMMON_cond)
+  n123c <- length(intersect(intersect(DEG_genes, DSG_genes), DMG_spliceProx_genes))
+
+  venn3_custom_counts(
+    area1 = length(DEG_genes),
+    area2 = length(DSG_genes),
+    area3 = length(DMG_all_genes),
+    n12 = n12, n13 = n13, n23 = n23c, n123 = n123c,
+    n1="DEG", n2="DSG", n3="DMG_all",
+    outpath = file.path(out_figs, paste0("Venn3_DEG_DSG_DMG_all_CONDITIONED_", comp, ".png"))
+  )
+
+  # ---------------- Scatters ----------------
+  DEG_sc <- build_scatter_deg_dmg(DEG, METH_gene)
+  fwrite(DEG_sc, file.path(out_tables, paste0("scatter_data_DEG_vs_DMG_all_", comp, ".tsv")), sep="\t")
+  plot_scatter_deg(DEG_sc[Type %in% c("DEG only","DMG only","COMMON")],
+                   file.path(out_figs, paste0("Scatter_DEG_vs_DMG_all_", comp, ".jpeg")))
+
+  DSG_sc <- build_scatter_dsg_dmg_only_common(
+    SPL_gene, METH_gene,
+    common_cond_genes = COMMON_cond,
+    dmg_all_genes = DMG_all_genes,
+    dsg_genes = DSG_genes
+  )
+  fwrite(DSG_sc, file.path(out_tables, paste0("scatter_data_DSG_vs_DMG_all_CONDITIONED_onlyCommon_", comp, ".tsv")), sep="\t")
+  plot_scatter_dsg_only_common(
+    DSG_sc,
+    file.path(out_figs, paste0("Scatter_DSG_vs_DMG_all_CONDITIONED_onlyCommon_", comp, ".jpeg"))
+  )
+
+  # ---------------- Lists ----------------
+  write_lines(DEG_genes, file.path(out_lists, paste0("genes_DEG_", comp, ".txt")))
+  write_lines(DSG_genes, file.path(out_lists, paste0("genes_DSG_topEvent_", comp, ".txt")))
+  write_lines(DMG_all_genes, file.path(out_lists, paste0("genes_DMG_all_", comp, ".txt")))
+
+  write_lines(COMMON_cond, file.path(out_lists, paste0("genes_COMMON_DSGxDMG_conditioned_", comp, ".txt")))
+
+  write_lines(intersect(DEG_genes, DMG_all_genes),
+              file.path(out_lists, paste0("genes_DEG_and_DMG_all_", comp, ".txt")))
+  write_lines(intersect(intersect(DEG_genes, DSG_genes), DMG_all_genes),
+              file.path(out_lists, paste0("genes_DEG_and_DSG_and_DMG_all_", comp, ".txt")))
+
+  write_lines(COMMON_cond,
+              file.path(out_lists, paste0("genes_DSG_and_DMG_all_CONDITIONED_", comp, ".txt")))
+
+  # -- genes that are both DSG and DMG_all, but where the DMR was NOT near
+  # the specific splicing event (i.e. fail the position-aware condition) --
+  # kept as a list for reference even though these points are intentionally
+  # left off the scatter plot (see header comment)
+  dsg_and_dmg_not_cond <- setdiff(intersect(DSG_genes, DMG_all_genes), COMMON_cond)
+  write_lines(dsg_and_dmg_not_cond,
+              file.path(out_lists, paste0("genes_DSG_and_DMG_all_but_NOT_conditioned_", comp, ".txt")))
+
+  # ---------------- Summary ----------------
+  summary_rows[[comp]] <- data.table(
+    comparison = comp,
+    n_DEG = length(DEG_genes),
+    n_DSG_top = length(DSG_genes),
+    n_DMG_all = length(DMG_all_genes),
+    n_DEGxDMG_all = length(intersect(DEG_genes, DMG_all_genes)),
+    n_DSGxDMG_all_CONDITIONED = length(COMMON_cond),
+    n_DEGxDSG = length(intersect(DEG_genes, DSG_genes)),
+    n_DEGxDSGxDMG_all_CONDITIONED = n123c,
+    n_DSG_and_DMG_all_but_NOT_conditioned = length(dsg_and_dmg_not_cond)
+  )
+
+  filter_rows[[comp]] <- data.table(
+    comparison = comp,
+    n_raw_rows_after_basic_clean = n_raw,
+    n_exon_intron_rows = n_ei,
+    dmr_abs_diff = args$dmr_abs_diff,
+    n_after_abs_diff = n_after_abs,
+    same_sign_if_multi = same_sign_if_multi,
+    n_after_same_sign_DMG_all = n_after_same_all,
+    n_genes_DMG_all = length(DMG_all_genes),
+    flank = args$flank,
+    same_sign_spliceProx = same_sign_spliceProx,
+    n_genes_DMG_spliceProx = length(DMG_spliceProx_genes),
+    n_COMMON_DSGxDMG_conditioned = length(COMMON_cond)
+  )
+
+  if (nzchar(only_set)) break
+}
+
+# -- pooled gene lists across every comparison processed in this run (useful
+# for "which genes show up as a DMG in at least one contrast" type queries)
+write_lines(DMG_all_union_all_comps,
+            file.path(out_lists, "genes_DMG_all_ALL_COMPARISONS.txt"))
+write_lines(COMMON_union_all_comps,
+            file.path(out_lists, "genes_COMMON_DSGxDMG_conditioned_ALL_COMPARISONS.txt"))
+
+if (length(summary_rows)) {
+  comb <- rbindlist(summary_rows, use.names=TRUE, fill=TRUE)
+  setorder(comb, comparison)
+  fwrite(comb, file.path(out_lists, "SUMMARY_ALL_DEG_DSG_DMG.tsv"), sep="\t")
+}
+
+if (length(filter_rows)) {
+  fsum <- rbindlist(filter_rows, use.names=TRUE, fill=TRUE)
+  setorder(fsum, comparison)
+  fwrite(fsum, file.path(out_tables, "DMR_filtering_summary.tsv"), sep="\t")
+}
+
+message("\nAll done.
+Output dir: ", outdir,
+        "\nFigs: ", out_figs,
+        "\nLists: ", out_lists,
+        "\nTables: ", out_tables)
