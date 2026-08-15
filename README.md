@@ -9,7 +9,7 @@ differential splicing (DSG) across sample comparisons.
 | Term | Meaning |
 |------|---------|
 | DEG | Pairwise differential gene expression between two samples/conditions |
-| DMG | Pairwise differential methylation analysis between two samples/conditions (5mC and 5hmC) |
+| DMG | Pairwise differential methylation analysis between two samples/conditions (5mC) |
 | DSG | Differentially spliced genes from a pairwise comparison |
 
 ## Repository structure
